@@ -113,7 +113,7 @@
       <div class="card">
         <h3>What to look for</h3>
         <label class="check"><input type="checkbox" id="findThings"> Things (pets, cars, food, phones and 70 more)</label>
-        <label class="check"><input type="checkbox" id="findCharacters"> Cartoon and anime characters (downloads about 36 MB the first time)</label>
+        <label class="check"><input type="checkbox" id="findCharacters"> Cartoon and anime characters (downloads about 162 MB once, then works offline)</label>
         <p class="muted small-note" id="charStatus"></p>
         <p class="muted small-note">Changes apply to photos and videos you add from now on.</p>
       </div>
@@ -150,9 +150,9 @@
       <div class="card">
         <h3>How it works</h3>
         <p class="muted">People: each face is turned into 128 numbers (a face descriptor) by a neural network. Faces with close numbers are the same person.</p>
-        <p class="muted">Characters: an anime face detector finds drawn faces, and a second network (DINOv2) turns each one into 384 numbers that describe its look, so the same character is grouped together.</p>
+        <p class="muted">Characters: an anime face detector finds drawn faces. A second network (CCIP), trained to tell whether two pictures show the same character, turns each one into 768 numbers, so the same character is grouped together.</p>
         <p class="muted">Things: an object detector (CenterNet) recognizes 80 kinds of everyday objects.</p>
-        <p class="muted">Videos: about one frame per second is checked (up to 90 frames per video), and the best view of each face is kept with its time, so you can jump straight to it.</p>
+        <p class="muted">Videos: about one frame per second is checked (up to 90 frames per video), and the best view of each face is kept with its time, so you can jump straight to it. Characters are checked on every third frame because that model is slower.</p>
       </div>
     </section>
   </main>

@@ -27,7 +27,7 @@ Named people are "locked": regrouping never moves their faces, and a face you re
 
 ### Characters and things
 
-- **Characters**: a YOLOv8 anime face detector ([deepghs/anime_face_detection](https://huggingface.co/deepghs/anime_face_detection), MIT) finds drawn faces. [DINOv2-small](https://huggingface.co/Xenova/dinov2-small) turns each one into 384 numbers, and faces with close numbers (cosine distance) are grouped. These two models (about 36 MB) are downloaded from Hugging Face the first time and cached. They run with [ONNX Runtime Web](https://onnxruntime.ai/).
+- **Characters**: a YOLOv8 anime face detector ([deepghs/anime_face_detection](https://huggingface.co/deepghs/anime_face_detection), MIT) finds drawn faces. [CCIP](https://huggingface.co/deepghs/ccip_onnx) (a model trained to tell whether two pictures show the same character) turns each one into 768 numbers, and faces with close numbers (cosine distance under 0.30 by default) are grouped. These two models (about 162 MB) are downloaded from Hugging Face once and cached. They run with [ONNX Runtime Web](https://onnxruntime.ai/), on the graphics card (WebGPU) when available. In a test with 7 anime characters, CCIP picked the right character as the closest match for 40 out of 40 faces.
 - **Things**: CenterNet (MobileNetV3) trained on COCO, from [@vladmandic/human-models](https://github.com/vladmandic/human-models) (MIT).
 
 Face models come from [@vladmandic/face-api](https://github.com/vladmandic/face-api) (MIT License), a maintained version of face-api.js built on TensorFlow.js.
@@ -60,3 +60,5 @@ terms.html      Terms and Conditions
 - HEIC photos (iPhone default) need converting to JPG first, except in Safari.
 - Very small or blurry faces (under about 36 pixels) are skipped.
 - Look-alike relatives can end up in one group. Use "remove face" or a stricter setting.
+- Characters whose face is hidden (masks, helmets) are not found.
+- The character model is large (about 162 MB, downloaded once) and needs roughly 1 second per character on a graphics card, 3 seconds without one. You can turn it off in Settings.

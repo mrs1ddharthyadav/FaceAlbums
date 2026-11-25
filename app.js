@@ -79,10 +79,11 @@ const saveSetting = (k) => putMany('meta', [{ k, v: settings[k] }]);
 
 // ---------- grouping math ----------
 // Real faces: Euclidean distance between 128-number descriptors. 0.60 (loose) .. 0.40 (strict).
-// Characters: cosine distance between DINOv2 embeddings. 0.40 (loose) .. 0.20 (strict).
+// Characters: cosine distance between CCIP embeddings. 0.40 (loose) .. 0.20 (strict).
 const thresholdFor = (kind) => (kind === 'anime' ? 0.40 - settings.charStrictness * 0.002 : 0.60 - settings.strictness * 0.002);
 
 function dist(kind, a, b) {
+  if (a.length !== b.length) return 9;          // descriptors from different model versions never match
   if (kind === 'anime') {
     let dot = 0, na = 0, nb = 0;
     for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
@@ -261,6 +262,8 @@ async function processVideo(file, onFrame) {
 
     const kept = [];          // best sighting of each face in this video
     const thingsBest = new Map();
+    // The character model is slow, so videos check characters on every third frame, up to 30 sightings
+    let characterLooks = 0;
     let thumbScore = -1;
     for (let i = 0; i < n; i++) {
       if (state.stopRequested) break;
@@ -269,7 +272,10 @@ async function processVideo(file, onFrame) {
       await once(v, 'seeked');
       onFrame(i + 1, n);
       const plain = detect.frameCanvas(v, v.videoWidth, v.videoHeight);
-      const found = await detect.analyzeFrame(plain, opts());
+      const o = opts();
+      if (o.characters && (i % 3 !== 0 || characterLooks >= 30)) o.characters = false;
+      const found = await detect.analyzeFrame(plain, o);
+      characterLooks += found.faces.filter((f) => f.kind === 'anime').length;
       // Cover frame: the one with the most faces, else the first
       if (found.faces.length > thumbScore) {
         thumbScore = found.faces.length;
@@ -578,7 +584,7 @@ function updateStrictnessText() {
 function updateCharStatus() {
   const s = detect.status.characters;
   $('charStatus').textContent = !settings.characters ? 'Off.'
-    : s === 'ready' ? 'Character models are ready.'
+    : s === 'ready' ? `Character models are ready (running on your ${detect.status.characterDevice}).`
       : s === 'loading' ? 'Downloading character models...'
         : s === 'failed' ? 'Character models could not be downloaded. Check your connection and reload.' : '';
 }

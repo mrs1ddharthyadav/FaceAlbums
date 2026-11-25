@@ -2,7 +2,7 @@
 //
 // Real faces:   face-api (SSD MobileNet detector + 68 landmarks + 128-number ResNet descriptor)
 // Things:       CenterNet (MobileNetV3) trained on COCO, 80 everyday object types
-// Characters:   YOLOv8n anime face detector (deepghs) + DINOv2-small image embedding
+// Characters:   YOLOv8n anime face detector + CCIP character embedding (both by deepghs)
 //
 // Everything runs in the browser. The face and object models ship with the app;
 // the two character models are downloaded from Hugging Face the first time and cached.
@@ -17,8 +17,10 @@ export const CROP_SIZE = 160;          // stored crop size for faces, characters
 const MIN_FACE_PX = 36;
 
 const ANIME_DETECTOR_URL = 'https://huggingface.co/deepghs/anime_face_detection/resolve/main/face_detect_v1.4_n/model.onnx';
-const EMBEDDER_URL = 'https://huggingface.co/Xenova/dinov2-small/resolve/main/onnx/model_quantized.onnx';
+// CCIP (Contrastive Character Image Pretraining) is trained to tell whether two pictures show the same character
+const EMBEDDER_URL = 'https://huggingface.co/deepghs/ccip_onnx/resolve/main/ccip-caformer-24-randaug-pruned/model_feat.onnx';
 const MODEL_CACHE = 'facealbums-models-v1';
+export const CHARACTER_DOWNLOAD_MB = 162;
 
 export const COCO_LABELS = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
   'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow', 'elephant', 'bear', 'zebra',
@@ -78,17 +80,25 @@ export function loadCharacterModels(onProgress) {
   if (charactersLoading) return charactersLoading;
   status.characters = 'loading';
   charactersLoading = (async () => {
-    ort = await import('./lib/ort/ort.wasm.min.mjs');
+    ort = await import('./lib/ort/ort.webgpu.min.mjs');
     ort.env.wasm.wasmPaths = new URL('./lib/ort/', location.href).href;
     ort.env.wasm.numThreads = 1;   // GitHub Pages cannot enable multi-threading
-    const sizes = [12, 24];
+    const sizes = [12, 150];
     let doneMB = 0;
     const prog = (i) => (got, total) => onProgress && onProgress((doneMB + got / 1048576) / (sizes[0] + sizes[1]), i);
     const a = await fetchModel(ANIME_DETECTOR_URL, prog(0));
     doneMB += sizes[0];
     const b = await fetchModel(EMBEDDER_URL, prog(1));
     animeSession = await ort.InferenceSession.create(a, { executionProviders: ['wasm'] });
-    embedSession = await ort.InferenceSession.create(b, { executionProviders: ['wasm'] });
+    // The graphics card (WebGPU) is about 4x faster for the big character model; fall back to the CPU
+    try {
+      if (!navigator.gpu || !(await navigator.gpu.requestAdapter())) throw new Error('no WebGPU');
+      embedSession = await ort.InferenceSession.create(b, { executionProviders: ['webgpu'] });
+      status.characterDevice = 'graphics card';
+    } catch {
+      embedSession = await ort.InferenceSession.create(b, { executionProviders: ['wasm'] });
+      status.characterDevice = 'processor';
+    }
     status.characters = 'ready';
   })().catch((e) => {
     console.error('character models', e);
@@ -240,7 +250,7 @@ async function findCharacters(plain) {
     found.push({
       kind: 'anime', px: k,
       box: { x: k.x / iw, y: k.y / ih, w: k.w / iw, h: k.h / ih },
-      desc: await embed(squareCrop(plain, k.x, k.y, k.w, k.h, 0.25, 224)),
+      desc: await embed(characterCrop(plain, k)),
       score: k.score,
       cropCanvas: squareCrop(plain, k.x, k.y, k.w, k.h, 0.35, CROP_SIZE),
     });
@@ -248,19 +258,29 @@ async function findCharacters(plain) {
   return found;
 }
 
-const MEAN = [0.485, 0.456, 0.406], STD = [0.229, 0.224, 0.225];
-async function embed(canvas224) {
-  const S = 224;
-  const px = canvas224.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, S, S).data;
+// CCIP looks at the head and some of the hair and clothes around it
+function characterCrop(canvas, k) {
+  const S = 384;
+  const side = Math.max(k.w, k.h) * 2;
+  const cx = k.x + k.w / 2, cy = k.y + k.h / 2 + k.h * 0.1;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.fillStyle = '#ffffff';
+  g.fillRect(0, 0, S, S);
+  g.drawImage(canvas, cx - side / 2, cy - side / 2, side, side, 0, 0, S, S);
+  return c;
+}
+
+async function embed(canvas384) {
+  const S = 384;
+  const px = canvas384.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, S, S).data;
   const input = new Float32Array(3 * S * S);
   for (let i = 0, p = 0; i < S * S; i++, p += 4) {
-    for (let ch = 0; ch < 3; ch++) input[i + ch * S * S] = (px[p + ch] / 255 - MEAN[ch]) / STD[ch];
+    for (let ch = 0; ch < 3; ch++) input[i + ch * S * S] = (px[p + ch] / 255 - 0.5) / 0.5;
   }
-  const name = embedSession.inputNames[0];
-  const res = await embedSession.run({ [name]: new ort.Tensor('float32', input, [1, 3, S, S]) });
-  let v;
-  if (res.pooler_output) v = Array.from(res.pooler_output.data);
-  else { const t = res[embedSession.outputNames[0]]; v = Array.from(t.data.slice(0, t.dims[t.dims.length - 1])); }
+  const res = await embedSession.run({ [embedSession.inputNames[0]]: new ort.Tensor('float32', input, [1, 3, S, S]) });
+  const v = Array.from(res[embedSession.outputNames[0]].data);
   const norm = Math.hypot(...v) || 1;
   return v.map((x) => x / norm);
 }
