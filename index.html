@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FaceAlbums: group your photos by face</title>
+  <meta name="description" content="Add your photos and FaceAlbums groups them by the people in them. Runs fully in your browser.">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#people" id="brand">
+      <img src="favicon.svg" alt="" width="28" height="28">
+      <span>FaceAlbums</span>
+    </a>
+    <nav class="tabs" aria-label="Sections">
+      <a href="#people" data-tab="people">People</a>
+      <a href="#photos" data-tab="photos">All photos</a>
+      <a href="#settings" data-tab="settings">Settings</a>
+    </nav>
+    <div class="actions">
+      <label class="btn primary" title="Pick photos">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+        <span>Add photos</span>
+        <input type="file" id="pickFiles" accept="image/*" multiple hidden>
+      </label>
+      <label class="btn" title="Pick a whole folder">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z"/></svg>
+        <span>Add folder</span>
+        <input type="file" id="pickFolder" webkitdirectory multiple hidden>
+      </label>
+    </div>
+  </header>
+
+  <div id="progress" class="progress" hidden>
+    <div class="progress-text"><span id="progressLabel">Scanning</span><button class="link" id="stopScan">Stop</button></div>
+    <div class="bar"><div id="progressBar"></div></div>
+  </div>
+
+  <main>
+    <section id="view-loading" class="view center-msg">
+      <p>Loading the face model (about 12 MB, only the first time)...</p>
+    </section>
+
+    <section id="view-empty" class="view center-msg" hidden>
+      <h1>Your photos, sorted by who is in them</h1>
+      <p>Add photos or a whole folder. FaceAlbums finds every face, puts photos of the same person together, and lets you name each person.</p>
+      <p class="muted">Your photos stay on this device. Nothing is uploaded.</p>
+      <div class="drop" id="dropZone">Drop photos here</div>
+    </section>
+
+    <section id="view-people" class="view" hidden>
+      <div class="section-head">
+        <h2>People <span class="count" id="peopleCount"></span></h2>
+      </div>
+      <div class="people-grid" id="peopleGrid"></div>
+      <details class="once" id="onceBox">
+        <summary>Faces seen only once <span class="count" id="onceCount"></span></summary>
+        <div class="people-grid small" id="onceGrid"></div>
+      </details>
+    </section>
+
+    <section id="view-person" class="view" hidden>
+      <a href="#people" class="back">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg> People
+      </a>
+      <div class="person-head">
+        <img id="personCover" alt="">
+        <div class="person-info">
+          <input id="personName" class="name-input" placeholder="Add a name" aria-label="Person name" maxlength="60">
+          <p class="muted" id="personStats"></p>
+          <div class="row">
+            <select id="mergeSelect" aria-label="Merge with another person"></select>
+            <button class="btn" id="mergeBtn">Merge</button>
+            <button class="btn" id="hideBtn">Hide person</button>
+          </div>
+        </div>
+      </div>
+      <h3>Faces <span class="muted small-note">Click a face that is not this person to remove it</span></h3>
+      <div class="faces-strip" id="personFaces"></div>
+      <h3>Photos</h3>
+      <div class="photo-grid" id="personPhotos"></div>
+    </section>
+
+    <section id="view-photos" class="view" hidden>
+      <div class="section-head">
+        <h2>All photos <span class="count" id="photoCount"></span></h2>
+      </div>
+      <div class="photo-grid" id="allPhotos"></div>
+    </section>
+
+    <section id="view-settings" class="view narrow" hidden>
+      <h2>Settings</h2>
+      <div class="card">
+        <h3>Grouping strictness</h3>
+        <p class="muted">Stricter keeps different people apart but may split one person into two groups. Looser joins more photos of the same person but may mix people who look alike.</p>
+        <div class="slider-row">
+          <span>Looser</span>
+          <input type="range" id="strictness" min="0" max="100" step="1">
+          <span>Stricter</span>
+        </div>
+        <p class="muted" id="strictnessValue"></p>
+        <button class="btn primary" id="regroupBtn">Regroup now</button>
+        <p class="muted small-note">Named people keep their faces. Unnamed groups are rebuilt.</p>
+      </div>
+      <div class="card">
+        <h3>Hidden people</h3>
+        <div class="people-grid small" id="hiddenGrid"></div>
+        <p class="muted" id="hiddenEmpty">Nobody is hidden.</p>
+      </div>
+      <div class="card">
+        <h3>Storage</h3>
+        <p class="muted" id="storageInfo"></p>
+        <button class="btn danger" id="wipeBtn">Delete all data</button>
+      </div>
+      <div class="card">
+        <h3>How it works</h3>
+        <p class="muted">Each face is turned into 128 numbers (a face descriptor) by a neural network running in your browser. Faces whose numbers are close are the same person, so they are put in the same group.</p>
+      </div>
+    </section>
+  </main>
+
+  <div id="viewer" class="viewer" hidden>
+    <button class="viewer-close" id="viewerClose" aria-label="Close">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg>
+    </button>
+    <button class="viewer-nav prev" id="viewerPrev" aria-label="Previous">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+    </button>
+    <div class="viewer-stage" id="viewerStage"></div>
+    <button class="viewer-nav next" id="viewerNext" aria-label="Next">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
+    </button>
+    <div class="viewer-caption" id="viewerCaption"></div>
+  </div>
+
+  <div id="toast" class="toast" hidden></div>
+
+  <footer class="footer">
+    <a href="privacy.html">Privacy Policy</a>
+    <a href="terms.html">Terms and Conditions</a>
+    <a href="https://github.com/mrs1ddharthyadav/FaceAlbums">Source code</a>
+  </footer>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
