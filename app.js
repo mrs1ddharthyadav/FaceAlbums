@@ -1,25 +1,25 @@
-// FaceAlbums: groups photos by the faces in them, fully in the browser.
-// Pipeline per photo: detect faces -> find 68 landmarks -> 128-number face descriptor.
-// Grouping: faces whose descriptors are close (Euclidean distance under a threshold) are the same person.
+// FaceAlbums: groups photos and videos by the people, cartoon characters and things in them.
+// Grouping: each face becomes a list of numbers (a descriptor). Faces whose descriptors are
+// close belong to the same person or character.
 
-import * as faceapi from './lib/face-api.esm.js';
+import * as detect from './detect.js';
 
-const DETECT_MAX_SIDE = 1600;   // big photos are scaled down to this before detection
-const DETECT_MIN_SIDE = 640;    // small photos are scaled up to this
-const THUMB_MAX_SIDE = 1280;    // stored preview size
-const CROP_SIZE = 160;          // stored face crop size
-const MIN_FACE_PX = 36;         // faces smaller than this give unreliable descriptors
+const THUMB_MAX_SIDE = 1280;
+const MAX_VIDEO_FRAMES = 90;        // frames sampled per video (spread over its length)
 const DEFAULT_STRICTNESS = 50;
 
 // ---------- state ----------
 const state = {
-  photos: new Map(),   // id -> {id, key, name, w, h, added, thumb: Blob}
-  faces: new Map(),    // id -> {id, photoId, box:{x,y,w,h} (0..1), desc: number[], crop: Blob, score, personId, notIn: []}
-  people: new Map(),   // id -> {id, name, hidden, created}
+  photos: new Map(),   // id -> {id, key, name, type:'image'|'video', w, h, added, taken, thumb, video?, duration?}
+  faces: new Map(),    // id -> {id, photoId, kind:'real'|'anime', box, desc, crop, score, personId, notIn, t?}
+  people: new Map(),   // id -> {id, kind, name, hidden, created}
+  things: new Map(),   // id -> {id, photoId, label, score, box, crop, t?}
   scanning: false,
   stopRequested: false,
   modelReady: false,
 };
+const settings = { strictness: DEFAULT_STRICTNESS, charStrictness: DEFAULT_STRICTNESS, things: true, characters: true };
+
 const urlCache = new WeakMap();
 const blobUrl = (blob) => {
   if (!blob) return '';
@@ -29,18 +29,20 @@ const blobUrl = (blob) => {
 };
 const uid = () => (crypto.randomUUID ? crypto.randomUUID() : Date.now().toString(36) + Math.random().toString(36).slice(2));
 const $ = (id) => document.getElementById(id);
+const kindOf = (x) => x.kind || 'real';
+const plural = (n, w) => `${n} ${w}${n === 1 ? '' : 's'}`;
+const fmtTime = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const capital = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 // ---------- IndexedDB ----------
 let db;
 function openDB() {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open('facealbums', 1);
+    const req = indexedDB.open('facealbums', 2);
     req.onupgradeneeded = () => {
       const d = req.result;
-      d.createObjectStore('photos', { keyPath: 'id' });
-      d.createObjectStore('faces', { keyPath: 'id' });
-      d.createObjectStore('people', { keyPath: 'id' });
-      d.createObjectStore('meta', { keyPath: 'k' });
+      for (const s of ['photos', 'faces', 'people', 'things']) if (!d.objectStoreNames.contains(s)) d.createObjectStore(s, { keyPath: 'id' });
+      if (!d.objectStoreNames.contains('meta')) d.createObjectStore('meta', { keyPath: 'k' });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -64,94 +66,87 @@ function getAll(store) {
 }
 const putMany = (store, items) => items.length ? tx([store], 'readwrite', (t) => items.forEach((i) => t.objectStore(store).put(i))) : Promise.resolve();
 const delMany = (store, ids) => ids.length ? tx([store], 'readwrite', (t) => ids.forEach((i) => t.objectStore(store).delete(i))) : Promise.resolve();
-async function getMeta(k, fallback) {
-  const rows = await getAll('meta');
-  const row = rows.find((r) => r.k === k);
-  return row ? row.v : fallback;
-}
-const setMeta = (k, v) => putMany('meta', [{ k, v }]);
 
 async function loadAll() {
-  const [photos, faces, people] = await Promise.all([getAll('photos'), getAll('faces'), getAll('people')]);
+  const [photos, faces, people, things, meta] = await Promise.all(['photos', 'faces', 'people', 'things', 'meta'].map(getAll));
   photos.forEach((p) => state.photos.set(p.id, p));
   faces.forEach((f) => state.faces.set(f.id, f));
   people.forEach((p) => state.people.set(p.id, p));
+  things.forEach((t) => state.things.set(t.id, t));
+  for (const m of meta) if (m.k in settings) settings[m.k] = m.v;
 }
+const saveSetting = (k) => putMany('meta', [{ k, v: settings[k] }]);
 
-// ---------- settings ----------
-let strictness = DEFAULT_STRICTNESS;
-// strictness 0..100 maps to a distance threshold 0.60 (looser) .. 0.40 (stricter)
-const threshold = () => 0.60 - strictness * 0.002;
+// ---------- grouping math ----------
+// Real faces: Euclidean distance between 128-number descriptors. 0.60 (loose) .. 0.40 (strict).
+// Characters: cosine distance between DINOv2 embeddings. 0.40 (loose) .. 0.20 (strict).
+const thresholdFor = (kind) => (kind === 'anime' ? 0.40 - settings.charStrictness * 0.002 : 0.60 - settings.strictness * 0.002);
 
-// ---------- math ----------
-function dist(a, b) {
+function dist(kind, a, b) {
+  if (kind === 'anime') {
+    let dot = 0, na = 0, nb = 0;
+    for (let i = 0; i < a.length; i++) { dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i]; }
+    return 1 - dot / (Math.sqrt(na * nb) || 1);
+  }
   let s = 0;
   for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; s += d * d; }
   return Math.sqrt(s);
 }
-// Bigger, more confident detections make better album covers and cluster seeds
-function faceQuality(f) { return (f.score || 0.5) * Math.sqrt(f.box.w * f.box.h); }
+// Bigger, more confident detections make better covers and cluster seeds
+const faceQuality = (f) => (f.score || 0.5) * Math.sqrt(f.box.w * f.box.h);
 
-// Cluster centroid = average descriptor of its faces
 function buildCentroids() {
   const sums = new Map();
   for (const f of state.faces.values()) {
     if (!f.personId) continue;
     let s = sums.get(f.personId);
-    if (!s) { s = { v: new Array(f.desc.length).fill(0), n: 0 }; sums.set(f.personId, s); }
-    for (let i = 0; i < f.desc.length; i++) s.v[i] += f.desc[i];
+    if (!s) { s = { sum: new Array(f.desc.length).fill(0), n: 0, kind: kindOf(f) }; sums.set(f.personId, s); }
+    for (let i = 0; i < f.desc.length; i++) s.sum[i] += f.desc[i];
     s.n++;
   }
   const c = new Map();
-  for (const [pid, s] of sums) c.set(pid, { v: s.v.map((x) => x / s.n), n: s.n, sum: s.v });
+  for (const [pid, s] of sums) c.set(pid, { v: s.sum.map((x) => x / s.n), sum: s.sum, n: s.n, kind: s.kind });
   return c;
 }
 function addToCentroid(c, desc) {
-  for (let i = 0; i < desc.length; i++) c.sum[i] += desc[i];
+  for (let i = 0; i < desc.length; i++) { c.sum[i] += desc[i]; c.v[i] = c.sum[i] / (c.n + 1); }
   c.n++;
-  for (let i = 0; i < desc.length; i++) c.v[i] = c.sum[i] / c.n;
 }
 
-// Put each unassigned face into the closest person, or start a new person.
+// Put each unassigned face into the closest group of the same kind, or start a new group
 function assignFaces(faceList, centroids = buildCentroids()) {
-  const T = threshold();
   const sorted = [...faceList].sort((a, b) => faceQuality(b) - faceQuality(a));
-  const changedPeople = new Set();
   for (const f of sorted) {
+    const kind = kindOf(f);
     let best = null, bestD = Infinity;
     for (const [pid, c] of centroids) {
-      if (f.notIn && f.notIn.includes(pid)) continue;
-      const p = state.people.get(pid);
-      if (!p) continue;
-      const d = dist(f.desc, c.v);
+      if (c.kind !== kind || (f.notIn && f.notIn.includes(pid)) || !state.people.has(pid)) continue;
+      const d = dist(kind, f.desc, c.v);
       if (d < bestD) { bestD = d; best = pid; }
     }
-    if (best && bestD < T) {
+    if (best && bestD < thresholdFor(kind)) {
       f.personId = best;
       addToCentroid(centroids.get(best), f.desc);
     } else {
-      const p = { id: uid(), name: '', hidden: false, created: Date.now() };
+      const p = { id: uid(), kind, name: '', hidden: false, created: Date.now() };
       state.people.set(p.id, p);
       f.personId = p.id;
-      centroids.set(p.id, { v: [...f.desc], sum: [...f.desc], n: 1 });
+      centroids.set(p.id, { v: [...f.desc], sum: [...f.desc], n: 1, kind });
     }
-    changedPeople.add(f.personId);
   }
-  return changedPeople;
 }
 
-// One refinement round: move unlocked faces to their nearest centroid, then merge
-// unnamed groups whose centroids are very close.
+// Refinement: move faces in unnamed groups to their nearest group, then join very close unnamed groups
 function refine() {
-  const T = threshold();
   let centroids = buildCentroids();
   for (const f of state.faces.values()) {
     const cur = state.people.get(f.personId);
     if (!cur || cur.name) continue;
-    let best = f.personId, bestD = dist(f.desc, centroids.get(f.personId).v);
+    const kind = kindOf(f), T = thresholdFor(kind);
+    let best = f.personId, bestD = dist(kind, f.desc, centroids.get(f.personId).v);
     for (const [pid, c] of centroids) {
-      if (pid === f.personId || (f.notIn && f.notIn.includes(pid))) continue;
-      const d = dist(f.desc, c.v);
+      if (pid === f.personId || c.kind !== kind || (f.notIn && f.notIn.includes(pid))) continue;
+      const d = dist(kind, f.desc, c.v);
       if (d < bestD - 0.02 && d < T) { bestD = d; best = pid; }
     }
     f.personId = best;
@@ -162,11 +157,12 @@ function refine() {
   for (let i = 0; i < ids.length; i++) {
     for (let j = i + 1; j < ids.length; j++) {
       const a = ids[i], b = ids[j];
-      if (mergedInto.has(a) || mergedInto.has(b)) continue;
+      const ca = centroids.get(a), cb = centroids.get(b);
+      if (ca.kind !== cb.kind || mergedInto.has(a) || mergedInto.has(b)) continue;
       const pa = state.people.get(a), pb = state.people.get(b);
       if (pa.name && pb.name) continue;
-      if (dist(centroids.get(a).v, centroids.get(b).v) < T * 0.85) {
-        const [keep, drop] = pb.name || centroids.get(b).n > centroids.get(a).n ? [b, a] : [a, b];
+      if (dist(ca.kind, ca.v, cb.v) < thresholdFor(ca.kind) * 0.85) {
+        const [keep, drop] = pb.name || cb.n > ca.n ? [b, a] : [a, b];
         mergedInto.set(drop, keep);
       }
     }
@@ -182,7 +178,7 @@ function removeEmptyPeople() {
   return gone;
 }
 
-async function saveEverything() {
+async function saveGroups() {
   await tx(['faces', 'people'], 'readwrite', (t) => {
     const fs = t.objectStore('faces'), ps = t.objectStore('people');
     ps.clear();
@@ -194,29 +190,16 @@ async function saveEverything() {
 async function regroup() {
   const named = new Set([...state.people.values()].filter((p) => p.name).map((p) => p.id));
   const loose = [];
-  for (const f of state.faces.values()) {
-    if (!named.has(f.personId)) { f.personId = null; loose.push(f); }
-  }
+  for (const f of state.faces.values()) if (!named.has(f.personId)) { f.personId = null; loose.push(f); }
   for (const id of [...state.people.keys()]) if (!named.has(id)) state.people.delete(id);
   assignFaces(loose);
   refine();
-  await saveEverything();
-}
-
-// ---------- model ----------
-async function loadModels() {
-  try { await faceapi.tf.setBackend('webgl'); } catch { /* falls back */ }
-  await faceapi.tf.ready();
-  await Promise.all([
-    faceapi.nets.ssdMobilenetv1.loadFromUri('./models'),
-    faceapi.nets.faceLandmark68Net.loadFromUri('./models'),
-    faceapi.nets.faceRecognitionNet.loadFromUri('./models'),
-  ]);
-  state.modelReady = true;
+  await saveGroups();
 }
 
 // ---------- import ----------
 const isImage = (f) => f.type.startsWith('image/') || /\.(jpe?g|png|webp|gif|bmp|avif)$/i.test(f.name);
+const isVideo = (f) => f.type.startsWith('video/') || /\.(mp4|m4v|mov|webm|mkv|3gp)$/i.test(f.name);
 const fileKey = (f) => `${f.webkitRelativePath || f.name}|${f.size}|${f.lastModified}`;
 
 function drawScaled(source, w, h, maxSide) {
@@ -226,126 +209,167 @@ function drawScaled(source, w, h, maxSide) {
   c.getContext('2d').drawImage(source, 0, 0, c.width, c.height);
   return c;
 }
-const toBlob = (canvas, q = 0.85) => new Promise((r) => canvas.toBlob(r, 'image/jpeg', q));
 
-function cropFace(canvas, box) {
-  const pad = 0.35;
-  const size = Math.max(box.width, box.height) * (1 + pad * 2);
-  const cx = box.x + box.width / 2, cy = box.y + box.height / 2;
-  const c = document.createElement('canvas');
-  c.width = c.height = CROP_SIZE;
-  const g = c.getContext('2d');
-  g.fillStyle = '#e9edf0';
-  g.fillRect(0, 0, CROP_SIZE, CROP_SIZE);
-  g.drawImage(canvas, cx - size / 2, cy - size / 2, size, size, 0, 0, CROP_SIZE, CROP_SIZE);
-  return toBlob(c, 0.8);
+const opts = () => ({ things: settings.things, characters: settings.characters && detect.status.characters === 'ready' });
+
+async function toRecords(found, photoId, t) {
+  const faces = [], things = [];
+  for (const f of found.faces) {
+    faces.push({ id: uid(), photoId, kind: f.kind, box: f.box, desc: f.desc, score: f.score, crop: await detect.toBlob(f.cropCanvas), personId: null, notIn: [], ...(t != null ? { t } : {}) });
+  }
+  for (const th of found.things) {
+    things.push({ id: uid(), photoId, label: th.label, score: th.score, box: th.box, crop: await detect.toBlob(th.cropCanvas), ...(t != null ? { t } : {}) });
+  }
+  return { faces, things };
 }
 
-async function processFile(file) {
+async function processImage(file) {
   let bmp;
   try { bmp = await createImageBitmap(file, { imageOrientation: 'from-image' }); }
   catch { return { skipped: true }; }
-  // Small images are scaled up so faces are big enough for the detector.
-  const scale = Math.min(DETECT_MAX_SIDE / Math.max(bmp.width, bmp.height), Math.max(1, DETECT_MIN_SIDE / Math.max(bmp.width, bmp.height)));
-  const iw = Math.round(bmp.width * scale), ih = Math.round(bmp.height * scale);
-  // A border around the photo lets the detector find faces that touch the edge
-  // (close-up selfies, tightly cropped profile pictures).
-  const pad = Math.round(Math.max(iw, ih) * 0.2);
-  const det = document.createElement('canvas');
-  det.width = iw + pad * 2; det.height = ih + pad * 2;
-  const g = det.getContext('2d', { willReadFrequently: true });
-  g.fillStyle = '#808080';
-  g.fillRect(0, 0, det.width, det.height);
-  g.drawImage(bmp, pad, pad, iw, ih);
-  const thumb = await toBlob(drawScaled(bmp, bmp.width, bmp.height, THUMB_MAX_SIDE), 0.85);
+  const plain = detect.frameCanvas(bmp, bmp.width, bmp.height);
+  const thumb = await detect.toBlob(drawScaled(bmp, bmp.width, bmp.height, THUMB_MAX_SIDE), 0.85);
   bmp.close && bmp.close();
+  const photo = { id: uid(), type: 'image', key: fileKey(file), name: file.name, w: plain.width, h: plain.height, added: Date.now(), taken: file.lastModified, thumb };
+  const found = await detect.analyzeFrame(plain, opts());
+  return { photo, ...(await toRecords(found, photo.id)) };
+}
 
-  const results = await faceapi
-    .detectAllFaces(det, new faceapi.SsdMobilenetv1Options({ minConfidence: 0.35, maxResults: 60 }))
-    .withFaceLandmarks()
-    .withFaceDescriptors();
+const once = (el, ev, ms = 15000) => new Promise((resolve, reject) => {
+  const timer = setTimeout(() => { cleanup(); reject(new Error('timeout')); }, ms);
+  const ok = () => { cleanup(); resolve(); };
+  const bad = () => { cleanup(); reject(new Error('media error')); };
+  const cleanup = () => { clearTimeout(timer); el.removeEventListener(ev, ok); el.removeEventListener('error', bad); };
+  el.addEventListener(ev, ok); el.addEventListener('error', bad);
+});
 
-  const photo = { id: uid(), key: fileKey(file), name: file.name, w: iw, h: ih, added: Date.now(), taken: file.lastModified, thumb };
-  const faces = [];
-  for (const r of results) {
-    const b = r.detection.box;
-    if (b.width < MIN_FACE_PX || b.height < MIN_FACE_PX) continue;
-    const x = Math.max(0, b.x - pad), y = Math.max(0, b.y - pad);
-    const w = Math.min(iw, b.x - pad + b.width) - x, h = Math.min(ih, b.y - pad + b.height) - y;
-    if (w <= 0 || h <= 0) continue;
-    faces.push({
-      id: uid(), photoId: photo.id,
-      box: { x: x / iw, y: y / ih, w: w / iw, h: h / ih },
-      desc: Array.from(r.descriptor), score: r.detection.score,
-      crop: await cropFace(det, b), personId: null, notIn: [],
-    });
+async function processVideo(file, onFrame) {
+  const url = URL.createObjectURL(file);
+  const v = document.createElement('video');
+  v.muted = true; v.playsInline = true; v.preload = 'auto';
+  try {
+    v.src = url;
+    await once(v, 'loadeddata');
+    let duration = v.duration;
+    if (!isFinite(duration)) {               // some recordings only report length after a seek to the end
+      v.currentTime = 1e7; await once(v, 'seeked'); duration = v.duration;
+    }
+    if (!isFinite(duration) || !v.videoWidth) return { skipped: true };
+    const n = Math.max(1, Math.min(MAX_VIDEO_FRAMES, Math.round(duration)));
+    const step = duration / n;
+    const photo = { id: uid(), type: 'video', key: fileKey(file), name: file.name, w: v.videoWidth, h: v.videoHeight, duration, added: Date.now(), taken: file.lastModified, video: file, thumb: null };
+
+    const kept = [];          // best sighting of each face in this video
+    const thingsBest = new Map();
+    let thumbScore = -1;
+    for (let i = 0; i < n; i++) {
+      if (state.stopRequested) break;
+      const t = Math.min(duration - 0.05, i * step + step / 2);
+      v.currentTime = t;
+      await once(v, 'seeked');
+      onFrame(i + 1, n);
+      const plain = detect.frameCanvas(v, v.videoWidth, v.videoHeight);
+      const found = await detect.analyzeFrame(plain, opts());
+      // Cover frame: the one with the most faces, else the first
+      if (found.faces.length > thumbScore) {
+        thumbScore = found.faces.length;
+        photo.thumb = await detect.toBlob(drawScaled(plain, plain.width, plain.height, THUMB_MAX_SIDE), 0.85);
+      }
+      for (const f of found.faces) {
+        const same = kept.find((k) => k.kind === f.kind && dist(f.kind, k.desc, f.desc) < thresholdFor(f.kind) * 0.9);
+        if (!same) kept.push({ ...f, t });
+        else if (faceQuality(f) > faceQuality(same)) Object.assign(same, f, { t });
+      }
+      for (const th of found.things) {
+        const cur = thingsBest.get(th.label);
+        if (!cur || th.score > cur.score) thingsBest.set(th.label, { ...th, t });
+      }
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    const faces = [], things = [];
+    for (const f of kept) faces.push((await toRecords({ faces: [f], things: [] }, photo.id, f.t)).faces[0]);
+    for (const th of thingsBest.values()) things.push((await toRecords({ faces: [], things: [th] }, photo.id, th.t)).things[0]);
+    return { photo, faces, things };
+  } catch (e) {
+    console.error(file.name, e);
+    return { skipped: true };
+  } finally {
+    v.removeAttribute('src'); v.load();
+    URL.revokeObjectURL(url);
   }
-  return { photo, faces };
 }
 
 async function importFiles(fileList) {
-  if (!state.modelReady) { toast('The face model is still loading. Try again in a moment.'); return; }
+  if (!state.modelReady) { toast('The AI models are still loading. Try again in a moment.'); return; }
   if (state.scanning) { toast('Already scanning. Wait for it to finish.'); return; }
+  const media = [...fileList].filter((f) => isImage(f) || isVideo(f));
   const known = new Set([...state.photos.values()].map((p) => p.key));
-  const files = [...fileList].filter((f) => isImage(f) && !known.has(fileKey(f)));
-  const dupes = [...fileList].filter(isImage).length - files.length;
-  if (!files.length) { toast(dupes ? 'These photos are already in your library.' : 'No photos found in that selection.'); return; }
+  const files = media.filter((f) => !known.has(fileKey(f)));
+  const dupes = media.length - files.length;
+  if (!files.length) { toast(dupes ? 'These are already in your library.' : 'No photos or videos found in that selection.'); return; }
 
   state.scanning = true; state.stopRequested = false;
   $('progress').hidden = false;
-  let done = 0, faceCount = 0, skipped = 0;
-  let pendingPhotos = [], pendingFaces = [];
+  if (settings.characters && detect.status.characters === 'loading') {
+    $('progressLabel').textContent = 'Waiting for the character model to finish downloading...';
+    try { await detect.loadCharacterModels(); } catch { /* continue without characters */ }
+  }
+  let done = 0, faceCount = 0, thingCount = 0, skipped = 0;
+  let pending = { photos: [], faces: [], things: [] };
   const flush = async () => {
-    if (!pendingPhotos.length) return;
-    assignFaces(pendingFaces);
-    await putMany('photos', pendingPhotos);
-    await saveEverything();
-    pendingPhotos = []; pendingFaces = [];
+    if (!pending.photos.length) return;
+    assignFaces(pending.faces);
+    await putMany('photos', pending.photos);
+    await putMany('things', pending.things);
+    await saveGroups();
+    pending = { photos: [], faces: [], things: [] };
     render();
   };
 
   for (const file of files) {
     if (state.stopRequested) break;
-    $('progressLabel').textContent = `Scanning ${done + 1} of ${files.length}: ${file.name}`;
+    const label = `${done + 1} of ${files.length}: ${file.name}`;
+    $('progressLabel').textContent = `Scanning ${label}`;
     try {
-      const res = await processFile(file);
+      const res = isVideo(file)
+        ? await processVideo(file, (i, n) => {
+          $('progressLabel').textContent = `Scanning video ${label} (frame ${i} of ${n})`;
+          $('progressBar').style.width = `${((done + i / n) / files.length) * 100}%`;
+        })
+        : await processImage(file);
       if (res.skipped) skipped++;
       else {
         state.photos.set(res.photo.id, res.photo);
         res.faces.forEach((f) => state.faces.set(f.id, f));
-        pendingPhotos.push(res.photo); pendingFaces.push(...res.faces);
-        faceCount += res.faces.length;
+        res.things.forEach((t) => state.things.set(t.id, t));
+        pending.photos.push(res.photo); pending.faces.push(...res.faces); pending.things.push(...res.things);
+        faceCount += res.faces.length; thingCount += res.things.length;
       }
     } catch (e) { console.error(file.name, e); skipped++; }
     done++;
     $('progressBar').style.width = `${(done / files.length) * 100}%`;
-    if (pendingPhotos.length >= 10) await flush();
+    if (pending.photos.length >= 10 || isVideo(file)) await flush();
     await new Promise((r) => setTimeout(r, 0));
   }
   await flush();
   refine();
-  await saveEverything();
+  await saveGroups();
 
   state.scanning = false;
   $('progress').hidden = true;
   $('progressBar').style.width = '0';
-  let msg = `Added ${done - skipped} photos and found ${faceCount} faces.`;
-  if (skipped) msg += ` ${skipped} could not be read (HEIC photos need converting to JPG first).`;
+  let msg = `Added ${done - skipped} items. Found ${plural(faceCount, 'face')} and ${plural(thingCount, 'thing')}.`;
+  if (skipped) msg += ` ${skipped} could not be read (HEIC photos and some video formats need converting first).`;
   if (dupes) msg += ` ${dupes} were already added.`;
-  toast(msg, 6000);
+  toast(msg, 7000);
   render();
 }
 
 // ---------- derived data ----------
-function personSummary(pid) {
-  const faces = [...state.faces.values()].filter((f) => f.personId === pid);
-  const photoIds = [...new Set(faces.map((f) => f.photoId))];
-  const cover = faces.reduce((a, b) => (!a || faceQuality(b) > faceQuality(a) ? b : a), null);
-  return { faces, photoIds, cover };
-}
-function allSummaries() {
+function groupSummaries(kind) {
   const by = new Map();
   for (const f of state.faces.values()) {
+    if (kindOf(f) !== kind) continue;
     if (!by.has(f.personId)) by.set(f.personId, []);
     by.get(f.personId).push(f);
   }
@@ -353,120 +377,210 @@ function allSummaries() {
   for (const [pid, faces] of by) {
     const p = state.people.get(pid);
     if (!p) continue;
-    const photoIds = new Set(faces.map((f) => f.photoId));
     const cover = faces.reduce((a, b) => (!a || faceQuality(b) > faceQuality(a) ? b : a), null);
-    out.push({ p, faces, count: photoIds.size, cover });
+    out.push({ p, faces, count: new Set(faces.map((f) => f.photoId)).size, cover });
   }
   return out.sort((a, b) => (!!b.p.name - !!a.p.name) || b.count - a.count);
 }
-const sortPhotos = (ids) => ids.map((id) => state.photos.get(id)).filter(Boolean).sort((a, b) => (b.taken || b.added) - (a.taken || a.added));
+function thingSummaries() {
+  const by = new Map();
+  for (const t of state.things.values()) {
+    if (!by.has(t.label)) by.set(t.label, []);
+    by.get(t.label).push(t);
+  }
+  return [...by].map(([label, list]) => ({
+    label, list,
+    count: new Set(list.map((t) => t.photoId)).size,
+    cover: list.reduce((a, b) => (!a || b.score * Math.sqrt(b.box.w * b.box.h) > a.score * Math.sqrt(a.box.w * a.box.h) ? b : a), null),
+  })).sort((a, b) => b.count - a.count);
+}
+const byDate = (a, b) => (b.taken || b.added) - (a.taken || a.added);
 
 // ---------- rendering ----------
-function personCard(s, onClick) {
+const SECTIONS = {
+  people: { kind: 'real', title: 'People', empty: 'No one appears in more than one photo or video yet. Add more.' },
+  characters: { kind: 'anime', title: 'Cartoon and anime characters', empty: 'No characters yet. Add cartoon or anime pictures or videos.' },
+};
+
+function personCard(s, route) {
   const a = document.createElement('a');
   a.className = 'person-card';
-  a.href = `#person/${s.p.id}`;
-  if (onClick) a.addEventListener('click', onClick);
+  a.href = `#${route}/${s.p.id}`;
   const img = document.createElement('img');
-  img.loading = 'lazy'; img.alt = s.p.name || 'Unnamed person';
+  img.loading = 'lazy'; img.alt = s.p.name || 'Unnamed';
   img.src = blobUrl(s.cover && s.cover.crop);
   const n = document.createElement('div');
   n.className = 'pname' + (s.p.name ? '' : ' unnamed');
   n.textContent = s.p.name || 'Add a name';
   const c = document.createElement('div');
   c.className = 'pcount';
-  c.textContent = `${s.count} photo${s.count === 1 ? '' : 's'}`;
+  c.textContent = plural(s.count, 'item');
   a.append(img, n, c);
   return a;
 }
 
-function photoGrid(container, photos) {
+function thingCard(s) {
+  const a = document.createElement('a');
+  a.className = 'person-card thing';
+  a.href = `#thing/${encodeURIComponent(s.label)}`;
+  const img = document.createElement('img');
+  img.loading = 'lazy'; img.alt = s.label; img.src = blobUrl(s.cover.crop);
+  const n = document.createElement('div');
+  n.className = 'pname'; n.textContent = capital(s.label);
+  const c = document.createElement('div');
+  c.className = 'pcount'; c.textContent = plural(s.count, 'item');
+  a.append(img, n, c);
+  return a;
+}
+
+const PLAY_ICON = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>';
+// items: [{photo, t?}]
+function mediaGrid(container, items) {
   container.replaceChildren();
-  const ids = photos.map((p) => p.id);
-  photos.forEach((p, i) => {
+  items.forEach((it, i) => {
+    const tile = document.createElement('button');
+    tile.className = 'tile';
+    tile.setAttribute('aria-label', it.photo.name);
     const img = document.createElement('img');
-    img.loading = 'lazy'; img.alt = p.name; img.src = blobUrl(p.thumb);
-    img.addEventListener('click', () => openViewer(ids, i));
-    container.append(img);
+    img.loading = 'lazy'; img.alt = ''; img.src = blobUrl(it.photo.thumb);
+    tile.append(img);
+    if (it.photo.type === 'video') {
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.innerHTML = PLAY_ICON;
+      badge.append(fmtTime(it.photo.duration || 0));
+      tile.append(badge);
+    }
+    tile.addEventListener('click', () => openViewer(items, i));
+    container.append(tile);
   });
 }
 
 function showView(name) {
   for (const v of document.querySelectorAll('.view')) v.hidden = v.id !== `view-${name}`;
-  for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('active', a.dataset.tab === name || (name === 'person' && a.dataset.tab === 'people'));
+  const tab = { person: currentSection, group: currentSection, thing: 'things' }[name] || name;
+  for (const a of document.querySelectorAll('.tabs a')) a.classList.toggle('active', a.dataset.tab === tab);
 }
 
+let currentSection = 'people';
 function render() {
   if (!state.modelReady && !state.photos.size) { showView('loading'); return; }
-  const hash = location.hash.slice(1) || 'people';
+  const hash = decodeURIComponent(location.hash.slice(1)) || 'people';
   const [route, arg] = hash.split('/');
   if (!state.photos.size && route !== 'settings') { showView('empty'); return; }
-  if (route === 'person' && state.people.has(arg)) return renderPerson(arg);
+  if ((route === 'people' || route === 'characters') && arg && state.people.has(arg)) { currentSection = route; return renderPerson(arg, route); }
+  if (route === 'characters') { currentSection = route; return renderGroups('characters'); }
+  if (route === 'things') return renderThings();
+  if (route === 'thing' && arg) return renderThing(arg);
   if (route === 'photos') return renderPhotos();
   if (route === 'settings') return renderSettings();
-  renderPeople();
+  currentSection = 'people';
+  renderGroups('people');
 }
 
-function renderPeople() {
-  showView('people');
-  const all = allSummaries().filter((s) => !s.p.hidden);
+function renderGroups(section) {
+  const cfg = SECTIONS[section];
+  showView('group');
+  $('groupTitle').textContent = cfg.title;
+  const all = groupSummaries(cfg.kind).filter((s) => !s.p.hidden);
   const main = all.filter((s) => s.count >= 2 || s.p.name);
-  const once = all.filter((s) => s.count < 2 && !s.p.name);
-  $('peopleCount').textContent = main.length;
-  $('peopleGrid').replaceChildren(...main.map((s) => personCard(s)));
-  if (!main.length) $('peopleGrid').innerHTML = '<p class="muted">No one appears in more than one photo yet. Add more photos.</p>';
-  $('onceBox').hidden = !once.length;
-  $('onceCount').textContent = once.length;
-  $('onceGrid').replaceChildren(...once.map((s) => personCard(s)));
+  const single = all.filter((s) => s.count < 2 && !s.p.name);
+  $('groupCount').textContent = main.length;
+  $('groupGrid').replaceChildren(...main.map((s) => personCard(s, section)));
+  if (!main.length) $('groupGrid').innerHTML = `<p class="muted">${cfg.empty}</p>`;
+  if (section === 'characters' && !settings.characters) $('groupGrid').innerHTML = '<p class="muted">Character finding is turned off. Turn it on in Settings.</p>';
+  $('onceBox').hidden = !single.length;
+  $('onceCount').textContent = single.length;
+  $('onceGrid').replaceChildren(...single.map((s) => personCard(s, section)));
 }
 
-function renderPerson(pid) {
+function renderPerson(pid, section) {
   showView('person');
   const p = state.people.get(pid);
-  const { faces, photoIds, cover } = personSummary(pid);
-  $('personCover').src = blobUrl(cover && cover.crop);
+  const faces = [...state.faces.values()].filter((f) => f.personId === pid).sort((a, b) => faceQuality(b) - faceQuality(a));
+  const items = new Map();
+  for (const f of faces) if (!items.has(f.photoId) && state.photos.has(f.photoId)) items.set(f.photoId, { photo: state.photos.get(f.photoId), t: f.t });
+  $('personBack').href = `#${section}`;
+  $('personBackLabel').textContent = SECTIONS[section].title;
+  $('personCover').src = blobUrl(faces[0] && faces[0].crop);
   const input = $('personName');
   if (document.activeElement !== input) input.value = p.name;
   input.dataset.pid = pid;
-  $('personStats').textContent = `${photoIds.length} photo${photoIds.length === 1 ? '' : 's'}, ${faces.length} face${faces.length === 1 ? '' : 's'}`;
-  $('hideBtn').textContent = p.hidden ? 'Unhide person' : 'Hide person';
+  const videos = [...items.values()].filter((i) => i.photo.type === 'video').length;
+  $('personStats').textContent = `${plural(items.size - videos, 'photo')}, ${plural(videos, 'video')}`;
+  $('hideBtn').textContent = p.hidden ? 'Unhide' : 'Hide';
 
-  const others = allSummaries().filter((s) => s.p.id !== pid);
   const sel = $('mergeSelect');
   sel.replaceChildren(new Option('Merge with...', ''));
-  others.forEach((s) => sel.add(new Option(`${s.p.name || 'Unnamed'} (${s.count} photo${s.count === 1 ? '' : 's'})`, s.p.id)));
+  groupSummaries(kindOf(p)).filter((s) => s.p.id !== pid)
+    .forEach((s) => sel.add(new Option(`${s.p.name || 'Unnamed'} (${plural(s.count, 'item')})`, s.p.id)));
 
   const strip = $('personFaces');
   strip.replaceChildren();
-  faces.sort((a, b) => faceQuality(b) - faceQuality(a)).forEach((f) => {
+  faces.forEach((f) => {
     const img = document.createElement('img');
-    img.src = blobUrl(f.crop); img.alt = 'Face'; img.title = 'Not this person? Click to remove';
+    img.src = blobUrl(f.crop); img.alt = 'Face'; img.title = 'Not this one? Click to remove';
     img.addEventListener('click', () => removeFace(f.id));
     strip.append(img);
   });
-  photoGrid($('personPhotos'), sortPhotos(photoIds));
+  mediaGrid($('personPhotos'), [...items.values()].sort((a, b) => byDate(a.photo, b.photo)));
+}
+
+function renderThings() {
+  showView('things');
+  const all = thingSummaries();
+  $('thingCount').textContent = all.length;
+  $('thingGrid').replaceChildren(...all.map(thingCard));
+  if (!settings.things) $('thingGrid').innerHTML = '<p class="muted">Finding things is turned off. Turn it on in Settings.</p>';
+  else if (!all.length) $('thingGrid').innerHTML = '<p class="muted">No things found yet. Pets, cars, food, phones and other everyday objects show up here.</p>';
+}
+
+function renderThing(label) {
+  showView('thing');
+  $('thingTitle').textContent = capital(label);
+  const items = new Map();
+  [...state.things.values()].filter((t) => t.label === label).sort((a, b) => b.score - a.score)
+    .forEach((t) => { if (!items.has(t.photoId) && state.photos.has(t.photoId)) items.set(t.photoId, { photo: state.photos.get(t.photoId), t: t.t }); });
+  $('thingStats').textContent = plural(items.size, 'item');
+  mediaGrid($('thingPhotos'), [...items.values()].sort((a, b) => byDate(a.photo, b.photo)));
 }
 
 function renderPhotos() {
   showView('photos');
-  const photos = sortPhotos([...state.photos.keys()]);
-  $('photoCount').textContent = photos.length;
-  photoGrid($('allPhotos'), photos);
+  const items = [...state.photos.values()].sort(byDate).map((photo) => ({ photo }));
+  $('photoCount').textContent = items.length;
+  mediaGrid($('allPhotos'), items);
 }
 
 async function renderSettings() {
   showView('settings');
-  $('strictness').value = strictness;
-  $('strictnessValue').textContent = `Current match distance: ${threshold().toFixed(2)} (default 0.50)`;
-  const hidden = allSummaries().filter((s) => s.p.hidden);
-  $('hiddenGrid').replaceChildren(...hidden.map((s) => personCard(s)));
+  $('strictness').value = settings.strictness;
+  $('charStrictness').value = settings.charStrictness;
+  $('findThings').checked = settings.things;
+  $('findCharacters').checked = settings.characters;
+  updateStrictnessText();
+  updateCharStatus();
+  const hidden = [...groupSummaries('real').map((s) => [s, 'people']), ...groupSummaries('anime').map((s) => [s, 'characters'])].filter(([s]) => s.p.hidden);
+  $('hiddenGrid').replaceChildren(...hidden.map(([s, r]) => personCard(s, r)));
   $('hiddenEmpty').hidden = !!hidden.length;
-  let info = `${state.photos.size} photos, ${state.faces.size} faces, ${state.people.size} groups.`;
+  const vids = [...state.photos.values()].filter((p) => p.type === 'video').length;
+  let info = `${plural(state.photos.size - vids, 'photo')}, ${plural(vids, 'video')}, ${plural(state.faces.size, 'face')}, ${plural(state.things.size, 'thing')}.`;
   if (navigator.storage && navigator.storage.estimate) {
     const e = await navigator.storage.estimate();
     info += ` Using ${(e.usage / 1048576).toFixed(1)} MB on this device.`;
   }
   $('storageInfo').textContent = info;
+}
+function updateStrictnessText() {
+  $('strictnessValue').textContent = `Match distance: ${thresholdFor('real').toFixed(2)} (default 0.50)`;
+  $('charStrictnessValue').textContent = `Match distance: ${thresholdFor('anime').toFixed(2)} (default 0.30)`;
+}
+function updateCharStatus() {
+  const s = detect.status.characters;
+  $('charStatus').textContent = !settings.characters ? 'Off.'
+    : s === 'ready' ? 'Character models are ready.'
+      : s === 'loading' ? 'Downloading character models...'
+        : s === 'failed' ? 'Character models could not be downloaded. Check your connection and reload.' : '';
 }
 
 // ---------- actions ----------
@@ -474,10 +588,10 @@ async function renamePerson(pid, name) {
   name = name.trim();
   const p = state.people.get(pid);
   if (!p || p.name === name) return;
-  const same = name && [...state.people.values()].find((o) => o.id !== pid && o.name.toLowerCase() === name.toLowerCase());
-  if (same && confirm(`"${same.name}" already exists. Is this the same person? Click OK to merge them.`)) {
+  const same = name && [...state.people.values()].find((o) => o.id !== pid && kindOf(o) === kindOf(p) && o.name.toLowerCase() === name.toLowerCase());
+  if (same && confirm(`"${same.name}" already exists. Is this the same one? Click OK to merge them.`)) {
     await mergePeople(pid, same.id);
-    location.hash = `#person/${same.id}`;
+    location.hash = `#${currentSection}/${same.id}`;
     return;
   }
   p.name = name;
@@ -503,44 +617,83 @@ async function removeFace(faceId) {
   const oldPid = f.personId;
   f.notIn = [...new Set([...(f.notIn || []), oldPid])];
   f.personId = null;
-  // see if it fits another existing person, otherwise it becomes its own group
-  const centroids = buildCentroids();
-  assignFaces([f], centroids);
+  assignFaces([f]);
   const gone = removeEmptyPeople();
   await putMany('faces', [f]);
   await putMany('people', [...state.people.values()]);
   await delMany('people', gone);
-  if (gone.includes(oldPid)) location.hash = '#people';
-  toast('Face removed from this person');
+  if (gone.includes(oldPid)) location.hash = `#${currentSection}`;
+  toast('Removed from this group');
   render();
 }
 
 // ---------- viewer ----------
-let viewer = { ids: [], i: 0 };
-function openViewer(ids, i) { viewer = { ids, i }; $('viewer').hidden = false; drawViewer(); }
-function closeViewer() { $('viewer').hidden = true; }
+let viewer = { items: [], i: 0 };
+function openViewer(items, i) { viewer = { items, i }; $('viewer').hidden = false; drawViewer(); }
+function closeViewer() {
+  const v = $('viewerStage').querySelector('video');
+  if (v) v.pause();
+  $('viewer').hidden = true;
+}
+function nameOf(f) {
+  const p = state.people.get(f.personId);
+  return (p && p.name) || (kindOf(f) === 'anime' ? 'Unnamed character' : 'Unnamed');
+}
 function drawViewer() {
-  const p = state.photos.get(viewer.ids[viewer.i]);
+  const { photo: p, t } = viewer.items[viewer.i];
   const stage = $('viewerStage');
+  const old = stage.querySelector('video');
+  if (old) old.pause();
   stage.replaceChildren();
-  const img = document.createElement('img');
-  img.src = blobUrl(p.thumb); img.alt = p.name;
-  stage.append(img);
   const faces = [...state.faces.values()].filter((f) => f.photoId === p.id);
-  for (const f of faces) {
-    const person = state.people.get(f.personId);
-    const box = document.createElement('div');
-    box.className = 'facebox';
-    Object.assign(box.style, { left: `${f.box.x * 100}%`, top: `${f.box.y * 100}%`, width: `${f.box.w * 100}%`, height: `${f.box.h * 100}%` });
-    const label = document.createElement('span');
-    label.textContent = (person && person.name) || 'Unnamed';
-    box.append(label);
-    box.addEventListener('click', () => { closeViewer(); location.hash = `#person/${f.personId}`; });
-    stage.append(box);
+  const things = [...state.things.values()].filter((x) => x.photoId === p.id);
+  const chips = $('viewerChips');
+  chips.replaceChildren();
+
+  if (p.type === 'video') {
+    const v = document.createElement('video');
+    v.controls = true; v.playsInline = true; v.preload = 'metadata';
+    v.src = blobUrl(p.video);
+    v.addEventListener('loadedmetadata', () => { if (t != null) v.currentTime = Math.max(0, t - 1); }, { once: true });
+    stage.append(v);
+    // Who and what is in this video, with a jump-to time
+    // one chip per person or character, at their first appearance
+    const seen = new Set();
+    for (const f of [...faces].sort((a, b) => (a.t || 0) - (b.t || 0))) {
+      if (seen.has(f.personId)) continue;
+      seen.add(f.personId);
+      const b = document.createElement('button');
+      b.className = 'chip';
+      const img = document.createElement('img'); img.src = blobUrl(f.crop); img.alt = '';
+      b.append(img, `${nameOf(f)} ${fmtTime(f.t || 0)}`);
+      b.addEventListener('click', () => { v.currentTime = Math.max(0, (f.t || 0) - 1); v.play(); });
+      chips.append(b);
+    }
+  } else {
+    const img = document.createElement('img');
+    img.src = blobUrl(p.thumb); img.alt = p.name;
+    stage.append(img);
+    for (const f of faces) {
+      const box = document.createElement('div');
+      box.className = 'facebox' + (kindOf(f) === 'anime' ? ' anime' : '');
+      Object.assign(box.style, { left: `${f.box.x * 100}%`, top: `${f.box.y * 100}%`, width: `${f.box.w * 100}%`, height: `${f.box.h * 100}%` });
+      const label = document.createElement('span');
+      label.textContent = nameOf(f);
+      box.append(label);
+      box.addEventListener('click', () => { closeViewer(); location.hash = `#${kindOf(f) === 'anime' ? 'characters' : 'people'}/${f.personId}`; });
+      stage.append(box);
+    }
   }
-  $('viewerCaption').textContent = `${p.name}  |  ${viewer.i + 1} of ${viewer.ids.length}  |  ${faces.length} face${faces.length === 1 ? '' : 's'}`;
+  for (const label of [...new Set(things.map((x) => x.label))]) {
+    const a = document.createElement('a');
+    a.className = 'chip thing-chip';
+    a.href = `#thing/${encodeURIComponent(label)}`;
+    a.textContent = capital(label);
+    chips.append(a);
+  }
+  $('viewerCaption').textContent = `${p.name}  |  ${viewer.i + 1} of ${viewer.items.length}`;
   $('viewerPrev').hidden = viewer.i === 0;
-  $('viewerNext').hidden = viewer.i === viewer.ids.length - 1;
+  $('viewerNext').hidden = viewer.i === viewer.items.length - 1;
 }
 
 // ---------- ui helpers ----------
@@ -552,12 +705,20 @@ function toast(msg, ms = 3000) {
   toastTimer = setTimeout(() => { t.hidden = true; }, ms);
 }
 
+function startCharacterModels() {
+  if (!settings.characters || detect.status.characters === 'ready' || detect.status.characters === 'loading') return;
+  detect.loadCharacterModels((frac) => {
+    if (!state.scanning) $('charStatus').textContent = `Downloading character models: ${Math.round(frac * 100)}%`;
+  }).then(() => { updateCharStatus(); render(); })
+    .catch(() => { updateCharStatus(); toast('Could not download the cartoon character models. Faces and things still work.', 6000); });
+  updateCharStatus();
+}
+
 function bindEvents() {
   $('pickFiles').addEventListener('change', (e) => { importFiles(e.target.files); e.target.value = ''; });
   $('pickFolder').addEventListener('change', (e) => { importFiles(e.target.files); e.target.value = ''; });
   $('stopScan').addEventListener('click', () => { state.stopRequested = true; $('progressLabel').textContent = 'Stopping...'; });
 
-  // drag and drop anywhere
   let depth = 0;
   window.addEventListener('dragenter', (e) => { e.preventDefault(); depth++; document.body.classList.add('dragging'); });
   window.addEventListener('dragleave', () => { if (--depth <= 0) { depth = 0; document.body.classList.remove('dragging'); } });
@@ -573,24 +734,27 @@ function bindEvents() {
 
   $('mergeBtn').addEventListener('click', async () => {
     const target = $('mergeSelect').value;
-    const pid = $('personName').dataset.pid;
-    if (!target) { toast('Pick a person to merge with first.'); return; }
-    await mergePeople(pid, target);
-    location.hash = `#person/${target}`;
+    if (!target) { toast('Pick who to merge with first.'); return; }
+    await mergePeople($('personName').dataset.pid, target);
+    location.hash = `#${currentSection}/${target}`;
   });
   $('hideBtn').addEventListener('click', async () => {
     const p = state.people.get($('personName').dataset.pid);
     p.hidden = !p.hidden;
     await putMany('people', [p]);
-    toast(p.hidden ? 'Hidden. Find hidden people in Settings.' : 'Unhidden');
+    toast(p.hidden ? 'Hidden. Find hidden ones in Settings.' : 'Unhidden');
     render();
   });
 
-  $('strictness').addEventListener('input', (e) => {
-    strictness = +e.target.value;
-    $('strictnessValue').textContent = `Current match distance: ${threshold().toFixed(2)} (default 0.50)`;
+  $('strictness').addEventListener('input', (e) => { settings.strictness = +e.target.value; updateStrictnessText(); });
+  $('charStrictness').addEventListener('input', (e) => { settings.charStrictness = +e.target.value; updateStrictnessText(); });
+  $('strictness').addEventListener('change', () => saveSetting('strictness'));
+  $('charStrictness').addEventListener('change', () => saveSetting('charStrictness'));
+  $('findThings').addEventListener('change', (e) => { settings.things = e.target.checked; saveSetting('things'); });
+  $('findCharacters').addEventListener('change', (e) => {
+    settings.characters = e.target.checked; saveSetting('characters');
+    startCharacterModels(); updateCharStatus();
   });
-  $('strictness').addEventListener('change', () => setMeta('strictness', strictness));
   $('regroupBtn').addEventListener('click', async () => {
     if (state.scanning) return toast('Wait for the scan to finish.');
     $('regroupBtn').disabled = true;
@@ -600,9 +764,9 @@ function bindEvents() {
     location.hash = '#people';
   });
   $('wipeBtn').addEventListener('click', async () => {
-    if (!confirm('Delete all photos, faces and names from FaceAlbums on this device? Your original photo files are not touched.')) return;
-    await tx(['photos', 'faces', 'people'], 'readwrite', (t) => ['photos', 'faces', 'people'].forEach((s) => t.objectStore(s).clear()));
-    state.photos.clear(); state.faces.clear(); state.people.clear();
+    if (!confirm('Delete all photos, videos, faces, things and names from FaceAlbums on this device? Your original files are not touched.')) return;
+    await tx(['photos', 'faces', 'people', 'things'], 'readwrite', (t) => ['photos', 'faces', 'people', 'things'].forEach((s) => t.objectStore(s).clear()));
+    state.photos.clear(); state.faces.clear(); state.people.clear(); state.things.clear();
     toast('All data deleted');
     location.hash = '#people';
     render();
@@ -610,10 +774,10 @@ function bindEvents() {
 
   $('viewerClose').addEventListener('click', closeViewer);
   $('viewerPrev').addEventListener('click', () => { if (viewer.i > 0) { viewer.i--; drawViewer(); } });
-  $('viewerNext').addEventListener('click', () => { if (viewer.i < viewer.ids.length - 1) { viewer.i++; drawViewer(); } });
+  $('viewerNext').addEventListener('click', () => { if (viewer.i < viewer.items.length - 1) { viewer.i++; drawViewer(); } });
   $('viewer').addEventListener('click', (e) => { if (e.target.id === 'viewer') closeViewer(); });
   window.addEventListener('keydown', (e) => {
-    if ($('viewer').hidden) return;
+    if ($('viewer').hidden || e.target.tagName === 'VIDEO') return;
     if (e.key === 'Escape') closeViewer();
     if (e.key === 'ArrowLeft') $('viewerPrev').click();
     if (e.key === 'ArrowRight') $('viewerNext').click();
@@ -626,19 +790,20 @@ async function start() {
   bindEvents();
   db = await openDB();
   await loadAll();
-  strictness = await getMeta('strictness', DEFAULT_STRICTNESS);
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
   render();
   try {
-    await loadModels();
+    await detect.loadCoreModels();
   } catch (e) {
     console.error(e);
-    $('view-loading').innerHTML = '<p>The face model could not load. Check your internet connection and reload the page.</p>';
+    $('view-loading').innerHTML = '<p>The AI models could not load. Check your internet connection and reload the page.</p>';
     showView('loading');
     return;
   }
+  state.modelReady = true;
   render();
+  startCharacterModels();
 }
 
 // exposed for automated tests
-window.FaceAlbums = { state, importFiles, regroup, threshold, ready: start() };
+window.FaceAlbums = { state, settings, detect, importFiles, regroup, ready: start() };

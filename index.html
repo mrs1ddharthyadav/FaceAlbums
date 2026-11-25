@@ -3,27 +3,29 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FaceAlbums: group your photos by face</title>
-  <meta name="description" content="Add your photos and FaceAlbums groups them by the people in them. Runs fully in your browser.">
+  <title>FaceAlbums: sort photos and videos by who and what is in them</title>
+  <meta name="description" content="Add photos and videos. FaceAlbums groups them by the people, cartoon characters and things in them. Runs fully in your browser.">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
   <header class="topbar">
-    <a class="brand" href="#people" id="brand">
+    <a class="brand" href="#people">
       <img src="favicon.svg" alt="" width="28" height="28">
       <span>FaceAlbums</span>
     </a>
     <nav class="tabs" aria-label="Sections">
       <a href="#people" data-tab="people">People</a>
-      <a href="#photos" data-tab="photos">All photos</a>
+      <a href="#characters" data-tab="characters">Characters</a>
+      <a href="#things" data-tab="things">Things</a>
+      <a href="#photos" data-tab="photos">All items</a>
       <a href="#settings" data-tab="settings">Settings</a>
     </nav>
     <div class="actions">
-      <label class="btn primary" title="Pick photos">
+      <label class="btn primary" title="Pick photos and videos">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
-        <span>Add photos</span>
-        <input type="file" id="pickFiles" accept="image/*" multiple hidden>
+        <span>Add photos and videos</span>
+        <input type="file" id="pickFiles" accept="image/*,video/*" multiple hidden>
       </label>
       <label class="btn" title="Pick a whole folder">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7h6l2 2h10v10H3z"/></svg>
@@ -40,52 +42,68 @@
 
   <main>
     <section id="view-loading" class="view center-msg">
-      <p>Loading the face model (about 12 MB, only the first time)...</p>
+      <p>Loading the AI models (about 16 MB, only the first time)...</p>
     </section>
 
     <section id="view-empty" class="view center-msg" hidden>
-      <h1>Your photos, sorted by who is in them</h1>
-      <p>Add photos or a whole folder. FaceAlbums finds every face, puts photos of the same person together, and lets you name each person.</p>
-      <p class="muted">Your photos stay on this device. Nothing is uploaded.</p>
-      <div class="drop" id="dropZone">Drop photos here</div>
+      <h1>Your photos and videos, sorted by who and what is in them</h1>
+      <p>Add photos, videos or a whole folder. FaceAlbums finds every face, puts the same person together, recognizes cartoon and anime characters, and spots everyday things like pets, cars and food.</p>
+      <p class="muted">Your photos and videos stay on this device. Nothing is uploaded.</p>
+      <div class="drop">Drop photos and videos here</div>
     </section>
 
-    <section id="view-people" class="view" hidden>
+    <section id="view-group" class="view" hidden>
       <div class="section-head">
-        <h2>People <span class="count" id="peopleCount"></span></h2>
+        <h2><span id="groupTitle">People</span> <span class="count" id="groupCount"></span></h2>
       </div>
-      <div class="people-grid" id="peopleGrid"></div>
+      <div class="people-grid" id="groupGrid"></div>
       <details class="once" id="onceBox">
-        <summary>Faces seen only once <span class="count" id="onceCount"></span></summary>
+        <summary>Seen only once <span class="count" id="onceCount"></span></summary>
         <div class="people-grid small" id="onceGrid"></div>
       </details>
     </section>
 
     <section id="view-person" class="view" hidden>
-      <a href="#people" class="back">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg> People
+      <a href="#people" class="back" id="personBack">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg> <span id="personBackLabel">People</span>
       </a>
       <div class="person-head">
         <img id="personCover" alt="">
         <div class="person-info">
-          <input id="personName" class="name-input" placeholder="Add a name" aria-label="Person name" maxlength="60">
+          <input id="personName" class="name-input" placeholder="Add a name" aria-label="Name" maxlength="60">
           <p class="muted" id="personStats"></p>
           <div class="row">
-            <select id="mergeSelect" aria-label="Merge with another person"></select>
+            <select id="mergeSelect" aria-label="Merge with another group"></select>
             <button class="btn" id="mergeBtn">Merge</button>
-            <button class="btn" id="hideBtn">Hide person</button>
+            <button class="btn" id="hideBtn">Hide</button>
           </div>
         </div>
       </div>
-      <h3>Faces <span class="muted small-note">Click a face that is not this person to remove it</span></h3>
+      <h3>Faces <span class="muted small-note">Click a face that does not belong here to remove it</span></h3>
       <div class="faces-strip" id="personFaces"></div>
-      <h3>Photos</h3>
+      <h3>Photos and videos</h3>
       <div class="photo-grid" id="personPhotos"></div>
+    </section>
+
+    <section id="view-things" class="view" hidden>
+      <div class="section-head">
+        <h2>Things <span class="count" id="thingCount"></span></h2>
+      </div>
+      <div class="people-grid" id="thingGrid"></div>
+    </section>
+
+    <section id="view-thing" class="view" hidden>
+      <a href="#things" class="back">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg> Things
+      </a>
+      <h2 id="thingTitle"></h2>
+      <p class="muted" id="thingStats"></p>
+      <div class="photo-grid" id="thingPhotos"></div>
     </section>
 
     <section id="view-photos" class="view" hidden>
       <div class="section-head">
-        <h2>All photos <span class="count" id="photoCount"></span></h2>
+        <h2>All items <span class="count" id="photoCount"></span></h2>
       </div>
       <div class="photo-grid" id="allPhotos"></div>
     </section>
@@ -93,21 +111,36 @@
     <section id="view-settings" class="view narrow" hidden>
       <h2>Settings</h2>
       <div class="card">
-        <h3>Grouping strictness</h3>
-        <p class="muted">Stricter keeps different people apart but may split one person into two groups. Looser joins more photos of the same person but may mix people who look alike.</p>
-        <div class="slider-row">
-          <span>Looser</span>
-          <input type="range" id="strictness" min="0" max="100" step="1">
-          <span>Stricter</span>
-        </div>
-        <p class="muted" id="strictnessValue"></p>
-        <button class="btn primary" id="regroupBtn">Regroup now</button>
-        <p class="muted small-note">Named people keep their faces. Unnamed groups are rebuilt.</p>
+        <h3>What to look for</h3>
+        <label class="check"><input type="checkbox" id="findThings"> Things (pets, cars, food, phones and 70 more)</label>
+        <label class="check"><input type="checkbox" id="findCharacters"> Cartoon and anime characters (downloads about 36 MB the first time)</label>
+        <p class="muted small-note" id="charStatus"></p>
+        <p class="muted small-note">Changes apply to photos and videos you add from now on.</p>
       </div>
       <div class="card">
-        <h3>Hidden people</h3>
+        <h3>Grouping strictness</h3>
+        <p class="muted">Stricter keeps different people apart but may split one person into two groups. Looser joins more of the same person but may mix up look-alikes.</p>
+        <p><strong>People</strong></p>
+        <div class="slider-row">
+          <span>Looser</span>
+          <input type="range" id="strictness" min="0" max="100" step="1" aria-label="People grouping strictness">
+          <span>Stricter</span>
+        </div>
+        <p class="muted small-note" id="strictnessValue"></p>
+        <p><strong>Characters</strong></p>
+        <div class="slider-row">
+          <span>Looser</span>
+          <input type="range" id="charStrictness" min="0" max="100" step="1" aria-label="Character grouping strictness">
+          <span>Stricter</span>
+        </div>
+        <p class="muted small-note" id="charStrictnessValue"></p>
+        <button class="btn primary" id="regroupBtn">Regroup now</button>
+        <p class="muted small-note">Named groups keep their faces. Unnamed groups are rebuilt.</p>
+      </div>
+      <div class="card">
+        <h3>Hidden</h3>
         <div class="people-grid small" id="hiddenGrid"></div>
-        <p class="muted" id="hiddenEmpty">Nobody is hidden.</p>
+        <p class="muted" id="hiddenEmpty">Nothing is hidden.</p>
       </div>
       <div class="card">
         <h3>Storage</h3>
@@ -116,7 +149,10 @@
       </div>
       <div class="card">
         <h3>How it works</h3>
-        <p class="muted">Each face is turned into 128 numbers (a face descriptor) by a neural network running in your browser. Faces whose numbers are close are the same person, so they are put in the same group.</p>
+        <p class="muted">People: each face is turned into 128 numbers (a face descriptor) by a neural network. Faces with close numbers are the same person.</p>
+        <p class="muted">Characters: an anime face detector finds drawn faces, and a second network (DINOv2) turns each one into 384 numbers that describe its look, so the same character is grouped together.</p>
+        <p class="muted">Things: an object detector (CenterNet) recognizes 80 kinds of everyday objects.</p>
+        <p class="muted">Videos: about one frame per second is checked (up to 90 frames per video), and the best view of each face is kept with its time, so you can jump straight to it.</p>
       </div>
     </section>
   </main>
@@ -132,7 +168,10 @@
     <button class="viewer-nav next" id="viewerNext" aria-label="Next">
       <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 5l7 7-7 7"/></svg>
     </button>
-    <div class="viewer-caption" id="viewerCaption"></div>
+    <div class="viewer-bottom">
+      <div class="viewer-chips" id="viewerChips"></div>
+      <div class="viewer-caption" id="viewerCaption"></div>
+    </div>
   </div>
 
   <div id="toast" class="toast" hidden></div>

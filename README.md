@@ -1,10 +1,15 @@
 # FaceAlbums
 
-Group your photos by the people in them, like the "People" section in Google Photos. Everything runs in your browser. Your photos are never uploaded.
+Group your photos and videos by the people, cartoon characters and things in them, like the "People" and "Things" sections in Google Photos. Everything runs in your browser. Nothing is uploaded.
+
+Live app: https://mrs1ddharthyadav.github.io/FaceAlbums/
 
 ## Features
 
-- Add photos or a whole folder (or drag and drop them)
+- Add photos, videos or a whole folder (or drag and drop them)
+- Videos: about one frame per second is checked, and each face is saved with its time so you can jump to it
+- Characters: finds cartoon and anime characters and groups the same character together
+- Things: 80 kinds of everyday objects (pets, cars, food, phones and more)
 - Finds every face and groups photos of the same person into an album
 - Name people, merge two groups that are the same person, remove a wrong face
 - Photo viewer with a labelled box on every face
@@ -20,7 +25,12 @@ Group your photos by the people in them, like the "People" section in Google Pho
 
 Named people are "locked": regrouping never moves their faces, and a face you remove from a person is never put back into that person.
 
-Models come from [@vladmandic/face-api](https://github.com/vladmandic/face-api) (MIT License), a maintained version of face-api.js built on TensorFlow.js.
+### Characters and things
+
+- **Characters**: a YOLOv8 anime face detector ([deepghs/anime_face_detection](https://huggingface.co/deepghs/anime_face_detection), MIT) finds drawn faces. [DINOv2-small](https://huggingface.co/Xenova/dinov2-small) turns each one into 384 numbers, and faces with close numbers (cosine distance) are grouped. These two models (about 36 MB) are downloaded from Hugging Face the first time and cached. They run with [ONNX Runtime Web](https://onnxruntime.ai/).
+- **Things**: CenterNet (MobileNetV3) trained on COCO, from [@vladmandic/human-models](https://github.com/vladmandic/human-models) (MIT).
+
+Face models come from [@vladmandic/face-api](https://github.com/vladmandic/face-api) (MIT License), a maintained version of face-api.js built on TensorFlow.js.
 
 ## Run locally
 
@@ -37,9 +47,10 @@ Then open http://localhost:8000. Opening `index.html` directly from disk does no
 ```
 index.html      app page
 style.css       styles
-app.js          detection, grouping, storage and UI
-lib/            face-api library (bundled with TensorFlow.js)
-models/         neural network weights (about 12 MB)
+app.js          grouping, storage, video scanning and UI
+detect.js       all AI models and per-frame analysis
+lib/            face-api (with TensorFlow.js) and ONNX Runtime Web
+models/         face and object model weights (about 16 MB)
 privacy.html    Privacy Policy
 terms.html      Terms and Conditions
 ```
